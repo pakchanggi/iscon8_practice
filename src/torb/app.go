@@ -1,4 +1,4 @@
-package torb
+package main
 
 import (
 	"bytes"
@@ -239,9 +239,8 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var sheetsMap map[int64]Sheet
-	var sheetsRankMap map[string]int
-	var sheets []Sheet
+	sheetsMap := make(map[int64]Sheet)
+	sheetsRankMap := make(map[string]int)
 	for rows.Next() {
 		var sheet Sheet
 		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
@@ -249,37 +248,37 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		}
 		sheetsMap[sheet.ID] = sheet
 		sheetsRankMap[sheet.Rank]++
+		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
+		event.Total++
+		event.Sheets[sheet.Rank].Total++
+		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &sheet)
 	}
 
-	var reservations []Reservation
+	reservedRank  := map[string]int{
+		"S": 0,
+		"A": 0,
+		"B": 0,
+		"C": 0,
+	}
 	// 予約情報を取得
-	reservationRows, err := db.Query("SELECT * FROM reservations WHERE event_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)", event.ID)
-
+	reservationRows, err := db.Query("SELECT * FROM reservations WHERE event_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at) ORDER BY sheet_id", event.ID)
 	defer reservationRows.Close()
+
 	for reservationRows.Next() {
 		var reservation Reservation
 		if err := reservationRows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
 			return nil, err
 		}
-		reservations = append(reservations, reservation)
-	}
-
-	var reservedRank map[string]int
-	for _,reservation := range reservations {
 		var sheet Sheet
 		sheet = sheetsMap[reservation.SheetID]
-		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
-		event.Total++
-		event.Sheets[sheet.Rank].Total++
-		sheet.Mine = reservation.UserID == loginUserID
-		sheet.Reserved = true
-		sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
-		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &sheet)
+		event.Sheets[sheet.Rank].Detail[sheet.Num-1].Mine = reservation.UserID == loginUserID
+		event.Sheets[sheet.Rank].Detail[sheet.Num-1].Reserved = true
+		event.Sheets[sheet.Rank].Detail[sheet.Num-1].ReservedAtUnix = reservation.ReservedAt.Unix()
 		reservedRank[sheet.Rank]++
 	}
 
 	// 残り情報
-	event.Remains = len(sheets)
+	event.Remains = 1000
 	for key,value := range reservedRank {
 		event.Remains = event.Remains - value
 		event.Sheets[key].Remains = sheetsRankMap[key] - value
@@ -332,9 +331,9 @@ var db *sql.DB
 
 func main() {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",
-		os.Getenv("DB_USER"), os.Getenv("DB_PASS"),
-		os.Getenv("DB_HOST"), os.Getenv("DB_PORT"),
-		os.Getenv("DB_DATABASE"),
+		"isucon", "isucon",
+		"150.95.137.228", "3306",
+		"torb",
 	)
 
 	var err error
@@ -612,7 +611,7 @@ func main() {
 
 		var sheet Sheet
 		var reservationID int64
-		rows, err := db.Query("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ?", event.ID, params.Rank)
+		rows, err := db.Query("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ? ORDER BY RAND()", event.ID, params.Rank)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "sold_out", 409)
