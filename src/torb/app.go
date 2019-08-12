@@ -223,6 +223,7 @@ func getEvents(all bool) ([]*Event, error) {
 
 func getEvent(eventID, loginUserID int64) (*Event, error) {
 	var event Event
+	// ユーザに紐づくイベントを取得
 	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
 		return nil, err
 	}
@@ -238,30 +239,50 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		return nil, err
 	}
 	defer rows.Close()
-
+	var sheetsMap map[int64]Sheet
+	var sheetsRankMap map[string]int
+	var sheets []Sheet
 	for rows.Next() {
 		var sheet Sheet
 		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
 			return nil, err
 		}
+		sheetsMap[sheet.ID] = sheet
+		sheetsRankMap[sheet.Rank]++
+	}
+
+	var reservations []Reservation
+	// 予約情報を取得
+	reservationRows, err := db.Query("SELECT * FROM reservations WHERE event_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)", event.ID)
+
+	defer reservationRows.Close()
+	for reservationRows.Next() {
+		var reservation Reservation
+		if err := reservationRows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+			return nil, err
+		}
+		reservations = append(reservations, reservation)
+	}
+
+	var reservedRank map[string]int
+	for _,reservation := range reservations {
+		var sheet Sheet
+		sheet = sheetsMap[reservation.SheetID]
 		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
 		event.Total++
 		event.Sheets[sheet.Rank].Total++
-
-		var reservation Reservation
-		err := db.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt)
-		if err == nil {
-			sheet.Mine = reservation.UserID == loginUserID
-			sheet.Reserved = true
-			sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
-		} else if err == sql.ErrNoRows {
-			event.Remains++
-			event.Sheets[sheet.Rank].Remains++
-		} else {
-			return nil, err
-		}
-
+		sheet.Mine = reservation.UserID == loginUserID
+		sheet.Reserved = true
+		sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
 		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &sheet)
+		reservedRank[sheet.Rank]++
+	}
+
+	// 残り情報
+	event.Remains = len(sheets)
+	for key,value := range reservedRank {
+		event.Remains = event.Remains - value
+		event.Sheets[key].Remains = sheetsRankMap[key] - value
 	}
 
 	return &event, nil
@@ -402,6 +423,7 @@ func main() {
 		})
 	})
 	e.GET("/api/users/:id", func(c echo.Context) error {
+		// User取得
 		var user User
 		if err := db.QueryRow("SELECT id, nickname FROM users WHERE id = ?", c.Param("id")).Scan(&user.ID, &user.Nickname); err != nil {
 			return err
@@ -415,6 +437,7 @@ func main() {
 			return resError(c, "forbidden", 403)
 		}
 
+		// 自分が予約している座席と予約情報を取得
 		rows, err := db.Query("SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id WHERE r.user_id = ? ORDER BY IFNULL(r.canceled_at, r.reserved_at) DESC LIMIT 5", user.ID)
 		if err != nil {
 			return err
@@ -422,6 +445,7 @@ func main() {
 		defer rows.Close()
 
 		var recentReservations []Reservation
+		// 予約している情報を回す
 		for rows.Next() {
 			var reservation Reservation
 			var sheet Sheet
@@ -429,6 +453,7 @@ func main() {
 				return err
 			}
 
+			// 紐づくイベントを取得
 			event, err := getEvent(reservation.EventID, -1)
 			if err != nil {
 				return err
