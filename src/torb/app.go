@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gomodule/redigo/redis"
 	"html/template"
 	"io"
 	"log"
@@ -22,6 +23,22 @@ import (
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/middleware"
 )
+
+var pool = newPool()
+
+func newPool() *redis.Pool {
+	return &redis.Pool{
+		MaxIdle:   80,
+		MaxActive: 12000, // max number of connections
+		Dial: func() (redis.Conn, error) {
+			c, err := redis.Dial("tcp", ":6379")
+			if err != nil {
+				panic(err.Error())
+			}
+			return c, err
+		},
+	}
+}
 
 type User struct {
 	ID        int64  `json:"id,omitempty"`
@@ -242,19 +259,18 @@ func getAllEvents(eventIDs []int64, loginUserID int64) (map[int64]*Event, error)
 		}
 		eventsMap[event.ID] = &event
 	}
-
-	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+	marshalSheets, err := redis.Bytes(pool.Get().Do("LRANGE", "sheets", 0, -1))
+	if err != nil {
+		panic(err)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	var sheets []Sheet
+	json.Unmarshal(marshalSheets, &sheets)
 	sheetsMap := make(map[int64]Sheet)
 	sheetsRankMap := make(map[string]int)
-	for rows.Next() {
-		var sheet Sheet
-		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-			return nil, err
-		}
+	for _,sheet := range sheets {
 		sheetsMap[sheet.ID] = sheet
 		sheetsRankMap[sheet.Rank]++
 		for _,event := range eventsMap {
@@ -313,18 +329,18 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		"C": &Sheets{},
 	}
 
-	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+	marshalSheets, err := redis.Bytes(pool.Get().Do("LRANGE", "sheets", 0, -1))
+	if err != nil {
+		panic(err)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	var sheets []Sheet
+	json.Unmarshal(marshalSheets, &sheets)
 	sheetsMap := make(map[int64]Sheet)
 	sheetsRankMap := make(map[string]int)
-	for rows.Next() {
-		var sheet Sheet
-		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-			return nil, err
-		}
+	for _,sheet := range sheets {
 		sheetsMap[sheet.ID] = sheet
 		sheetsRankMap[sheet.Rank]++
 		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
@@ -394,7 +410,10 @@ func fillinAdministrator(next echo.HandlerFunc) echo.HandlerFunc {
 
 func validateRank(rank string) bool {
 	var count int
-	db.QueryRow("SELECT COUNT(*) FROM sheets WHERE `rank` = ?", rank).Scan(&count)
+	count, err := redis.Int(pool.Get().Do("GET", rank))
+	if err != nil {
+		panic(err)
+	}
 	return count > 0
 }
 
@@ -408,12 +427,33 @@ func (r *Renderer) Render(w io.Writer, name string, data interface{}, c echo.Con
 
 var db *sql.DB
 
+func redisSet() {
+	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+	if err != nil {
+	}
+	for rows.Next() {
+		var sheet Sheet
+		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+		}
+		selia, _ := json.Marshal(sheet)
+		pool.Get().Do("RPUSH", "sheets", selia)
+		//pool.Get().Do("SET", sheet.ID, selia)
+	}
+	count := 0
+	rank := ""
+	if err := db.QueryRow("SELECT rank,count(*) FROM sheets group by rank").Scan(&rank,&count); err != nil {
+		log.Fatal(err)
+	}
+	pool.Get().Do("SET", rank, count)
+}
+
 func main() {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",
 		"isucon", "isucon",
 		"150.95.137.228", "3306",
 		"torb",
 	)
+	redisSet()
 
 	var err error
 	db, err = sql.Open("mysql", dsn)
