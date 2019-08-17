@@ -84,32 +84,34 @@ type Administrator struct {
 	PassHash  string `json:"pass_hash,omitempty"`
 }
 
-var sharedInstance *[]*Sheet
+var sharedInstance []*Sheet
 
-func newSheets() *[]*Sheet {
+func newSheets() []*Sheet {
 	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
 	if err != nil {
 	}
-	var sheets []*Sheet
+	defer rows.Close()
+	sheets := make([]*Sheet,0)
 	for rows.Next() {
 		var sheet Sheet
 		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
 		}
 		sheets = append(sheets, &sheet)
 	}
-	return &sheets
+	return sheets
 }
 
-func GetInstance() *[]*Sheet {
+func GetInstance() []*Sheet {
 	return sharedInstance
 }
 
-var sharedMapInstance *map[int64]*Sheet
+var sharedMapInstance map[int64]*Sheet
 
-func newSheetMaps() *map[int64]*Sheet {
-	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+func newSheetMaps() map[int64]*Sheet {
+	rows, err := db.Query("SELECT * FROM sheets")
 	if err != nil {
 	}
+	defer rows.Close()
 	sheetsMap := make(map[int64]*Sheet)
 	for rows.Next() {
 		var sheet Sheet
@@ -117,10 +119,10 @@ func newSheetMaps() *map[int64]*Sheet {
 		}
 		sheetsMap[sheet.ID] = &sheet
 	}
-	return &sheetsMap
+	return sheetsMap
 }
 
-func GetMapInstance() *map[int64]*Sheet {
+func GetMapInstance() map[int64]*Sheet {
 	return sharedMapInstance
 }
 
@@ -261,10 +263,14 @@ func getEvents(all bool) ([]*Event, error) {
 	return events, nil
 }
 
-func getAllEvents(eventIDs []int64, loginUserID int64) (map[int64]*Event, error) {
+func getAllEvents(eventIDs []int, loginUserID int64) (map[int64]*Event, error) {
 	eventsMap := make(map[int64]*Event)
-	// ユーザに紐づくイベントを取得
-	eventRows ,err := db.Query("SELECT * FROM events WHERE id in ?", eventIDs);
+	query := "("
+	for _,eventId := range eventIDs {
+		query = query + strconv.Itoa(eventId) + ","
+	}
+	query = query + "0)"
+	eventRows ,err := db.Query("SELECT * FROM events WHERE id in " + query);
 	if err != nil {
 		return nil, err
 	}
@@ -284,27 +290,29 @@ func getAllEvents(eventIDs []int64, loginUserID int64) (map[int64]*Event, error)
 	}
 
 	sheets := GetInstance()
-	sheetsMap := make(map[int64]Sheet)
+	sheetsMap :=GetMapInstance()
 	sheetsRankMap := make(map[string]int)
-	for _,sheet := range *sheets {
-		sheetsMap[sheet.ID] = *sheet
+	for _,sheet := range sheets {
+		var newSheet Sheet
+		newSheet = *sheet
 		sheetsRankMap[sheet.Rank]++
 		for _,event := range eventsMap {
 			event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
 			event.Total++
 			event.Sheets[sheet.Rank].Total++
-			event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, sheet)
+			event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &newSheet)
+			event.Remains = 1000
 		}
 	}
 
-	reservedRank  := map[string]int{
-		"S": 0,
-		"A": 0,
-		"B": 0,
-		"C": 0,
-	}
+	reservedRank  := make(map[string]int)
+	//	"S": 0,
+	//	"A": 0,
+	//	"B": 0,
+	//	"C": 0,
+	//}
 	// 予約情報を取得
-	reservationRows, err := db.Query("SELECT * FROM reservations WHERE event_id in ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at) ORDER BY sheet_id", eventIDs)
+	reservationRows, err := db.Query("SELECT * FROM reservations WHERE event_id in " + query + " AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at) ORDER BY sheet_id")
 	defer reservationRows.Close()
 
 	for reservationRows.Next() {
@@ -312,22 +320,19 @@ func getAllEvents(eventIDs []int64, loginUserID int64) (map[int64]*Event, error)
 		if err := reservationRows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
 			return nil, err
 		}
-		var sheet Sheet
-		sheet = sheetsMap[reservation.SheetID]
+		sheet := sheetsMap[reservation.SheetID]
 		eventsMap[reservation.EventID].Sheets[sheet.Rank].Detail[sheet.Num-1].Mine = reservation.UserID == loginUserID
 		eventsMap[reservation.EventID].Sheets[sheet.Rank].Detail[sheet.Num-1].Reserved = true
 		eventsMap[reservation.EventID].Sheets[sheet.Rank].Detail[sheet.Num-1].ReservedAtUnix = reservation.ReservedAt.Unix()
-		reservedRank[sheet.Rank]++
+		reservedRank[strconv.Itoa(int(reservation.EventID)) + sheet.Rank]++
 	}
 
 	// 残り情報
-	for _,event := range eventsMap {
-		event.Remains = 1000
 		for key, value := range reservedRank {
-			event.Remains = event.Remains - value
-			event.Sheets[key].Remains = sheetsRankMap[key] - value
+			eventId, _ := strconv.ParseInt(key[:len(key)-1],10,64)
+			eventsMap[eventId].Remains = eventsMap[eventId].Remains - value
+			eventsMap[eventId].Sheets[key[len(key)-1:len(key)]].Remains = sheetsRankMap[key[len(key)-1:len(key)]] - value
 		}
-	}
 
 	return eventsMap, nil
 }
@@ -346,15 +351,16 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	}
 
 	sheets := GetInstance()
-	sheetsMap := make(map[int64]Sheet)
+	sheetsMap :=GetMapInstance()
 	sheetsRankMap := make(map[string]int)
-	for _,sheet := range *sheets {
-		sheetsMap[sheet.ID] = *sheet
+	for _,sheet := range sheets {
+		var newSheet Sheet
+		newSheet = *sheet
 		sheetsRankMap[sheet.Rank]++
 		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
 		event.Total++
 		event.Sheets[sheet.Rank].Total++
-		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, sheet)
+		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &newSheet)
 	}
 
 	reservedRank  := map[string]int{
@@ -372,8 +378,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		if err := reservationRows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
 			return nil, err
 		}
-		var sheet Sheet
-		sheet = sheetsMap[reservation.SheetID]
+		sheet := sheetsMap[reservation.SheetID]
 		event.Sheets[sheet.Rank].Detail[sheet.Num-1].Mine = reservation.UserID == loginUserID
 		event.Sheets[sheet.Rank].Detail[sheet.Num-1].Reserved = true
 		event.Sheets[sheet.Rank].Detail[sheet.Num-1].ReservedAtUnix = reservation.ReservedAt.Unix()
@@ -548,10 +553,10 @@ func main() {
 		defer rows.Close()
 
 		var recentReservations []Reservation
-		sheetsMap := make(map[int64]Sheet)
-
-		var reservations []Reservation
-		var eventIds []int64
+		//sheetsMap := make(map[int64]Sheet)
+		//
+		//var reservations []Reservation
+		//var eventIds []int
 		// 予約している情報を回す
 		for rows.Next() {
 			var reservation Reservation
@@ -559,24 +564,37 @@ func main() {
 			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &sheet.Rank, &sheet.Num); err != nil {
 				return err
 			}
-			reservations = append(reservations, reservation)
-			eventIds = append(eventIds,reservation.EventID)
-			sheetsMap[reservation.SheetID] = sheet
-		}
-		// 紐づくイベントを取得
-		events, err := getAllEvents(eventIds, -1)
-		if err != nil {
-			return err
-		}
-		for _,reservation := range reservations {
-			price := events[reservation.EventID].Sheets[sheetsMap[reservation.SheetID].Rank].Price
-			events[reservation.EventID].Sheets = nil
-			events[reservation.EventID].Total = 0
-			events[reservation.EventID].Remains = 0
+		//	reservations = append(reservations, reservation)
+		//	eventIds = append(eventIds,int(reservation.EventID))
+		//	sheetsMap[reservation.SheetID] = sheet
+		//}
+		//// 紐づくイベントを取得
+		//events := make(map[int64]*Event)
+		//events, err = getAllEvents(eventIds, -1)
+		//if err != nil {
+		//	return err
+		//}
+		//for _,reservation := range reservations {
+		//	price := events[reservation.EventID].Sheets[sheetsMap[reservation.SheetID].Rank].Price
+		//	events[reservation.EventID].Sheets = nil
+		//	events[reservation.EventID].Total = 0
+		//	events[reservation.EventID].Remains = 0
+		//
+		//	reservation.Event = events[reservation.EventID]
+		//	reservation.SheetRank = sheetsMap[reservation.SheetID].Rank
+		//	reservation.SheetNum = sheetsMap[reservation.SheetID].Num
+			event, err := getEvent(reservation.EventID, -1)
+			if err != nil {
+				return err
+			}
+			price := event.Sheets[sheet.Rank].Price
+			event.Sheets = nil
+			event.Total = 0
+			event.Remains = 0
 
-			reservation.Event = events[reservation.EventID]
-			reservation.SheetRank = sheetsMap[reservation.SheetID].Rank
-			reservation.SheetNum = sheetsMap[reservation.SheetID].Num
+			reservation.Event = event
+			reservation.SheetRank = sheet.Rank
+			reservation.SheetNum = sheet.Num
 			reservation.Price = price
 			reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
 			if reservation.CanceledAt != nil {
@@ -601,21 +619,27 @@ func main() {
 		defer rows.Close()
 
 		var recentEvents []*Event
-		var recentEventIds []int64
+		//var recentEventIds []int64
 		for rows.Next() {
 			var eventID int64
 			if err := rows.Scan(&eventID); err != nil {
 				return err
 			}
-			recentEventIds = append(recentEventIds, eventID)
-		}
-		// 紐づくイベントを取得
-		recentAllEvents, err := getAllEvents(eventIds, -1)
-		if err != nil {
+		//	recentEventIds = append(recentEventIds, eventID)
+		//}
+		//// 紐づくイベントを取得
+		//recentAllEvents := make(map[int64]*Event)
+		//recentAllEvents, err = getAllEvents(eventIds, -1)
+		//if err != nil {
+		//	return err
+		//}
+		//for _,event := range recentAllEvents {
+		//	for k := range event.Sheets{
+			event, err := getEvent(eventID, -1)
+			if err != nil {
 			return err
 		}
-		for _,event := range recentAllEvents {
-			for k := range event.Sheets{
+		for k := range event.Sheets {
 				event.Sheets[k].Detail = nil
 			}
 			recentEvents = append(recentEvents, event)
@@ -631,7 +655,7 @@ func main() {
 			"total_price":         totalPrice,
 			"recent_events":       recentEvents,
 		})
-	}, loginRequired)
+	},loginRequired)
 	e.POST("/api/actions/login", func(c echo.Context) error {
 		var params struct {
 			LoginName string `json:"login_name"`
@@ -1042,7 +1066,7 @@ func main() {
 			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &event.ID, &event.Price); err != nil {
 				return err
 			}
-			sheet := (*sheetsMap)[reservation.EventID]
+			sheet := *sheetsMap[reservation.SheetID]
 			report := Report{
 				ReservationID: reservation.ID,
 				EventID:       event.ID,
